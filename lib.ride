@@ -1,0 +1,140 @@
+{-# SCRIPT_TYPE  ACCOUNT #-}
+{-# CONTENT_TYPE LIBRARY #-}
+{-# STDLIB_VERSION 6 #-}
+
+# Constants
+let SEP = "__"
+let minAmount = 1_000_000
+let MULT6 = 1_000_000
+let MULT8 = 100_000_000
+let MULT10 = 10_000_000_000
+
+# Providers asset id's
+let wxAssetId = base58'Atqv59EYzjFGuitKVnMRk6H8FukjoV3ktPorbEys25on'
+let surfAssetId = base58'At8D6NFFpheCbvKVnjVoeLL84Eo8NZn6ovManxfLaFWL'
+let xtnAssetId = base58'DG2xFkPdDwKUoBkzGAhQtLpSGzfXLiCYPEzeKH2Ad24p'
+let viresAssetId = base58'DSbbhLsSTeDg5Lsiufk2Aneh3DjVqJuPr2M9uU1gwy5p'
+
+# Provider addresses
+let dexContract = base58'3PLPCb3wF2H2gtzohoAjeWcGaMKEiJvtE5X'
+let wavesExchangeDexContract = base58'3P68zNiufsu1viZpu1aY3cdahRRKcvV5N93'
+let neutrinoContractAddress = base58'3PC9BfRwJWWiw9AREE2B3eWzCks3CYtg4yo'
+let neutrinoStakingAddress = base58'3PBiotFpqjRMkkeFBccnQNUXUopy7KFez5C'
+let neutrinoPriceIndexAddress = base58'3P5Bfd58PPfNvBM2Hy8QfbcDqMeNtzg7KfP'
+
+# Xtn Swap State enum
+let caseXtnSwapStateIdle = 0
+let caseXtnSwapStateXtnToRewards = 1
+let caseXtnSwapStateExchangeRewardsOnDex = 2
+
+################
+# Storage Keys #
+################
+let constructedKey = "constructed"
+let adminAddressKey = "adminAddress"
+let xtnSwapStateEnumKey = "xtnSwapStateEnum"
+let withdrawalFeeBasisKey = "withdrawalFeeBasis"
+
+# Amounts totals tracking
+let totalSurfStakedKey = "totalSurfStaked"
+let totalGNsbtKey = "totalGNsbt"
+let totalSurfWithdrawalRevenueKey = "totalSurfWithdrawalRevenueKey"
+let pendingTotalSurfAmountToWithdrawalKey = "pendingTotalSuftAmountToWithdrawal"
+
+# Total claimed info tracking
+let totalXtnEarnedKey = "totalXtnEarnedKey"
+let totalStakingRewardsWavesClaimedKey = "totalStakingRewardsWavesClaimed"
+let totalStakingRewardsXtnClaimedKey = "totalStakingRewardsXtnClaimed"
+let totalStakingRewardsViresClaimedKey = "totalStakingRewardsViresClaimed"
+let totalStakingRewardsWXClaimedKey = "totalStakingRewardsWXClaimed"
+
+# Last swap info tracking
+let lastSwapTotalSurfStakedKey = "lastSwapTotalSurfStakedKey"
+let lastSwapTotalXtnEarnedKey = "lastSwapTotalXtnEarnedKey"
+let lastStakingRewardsWavesClaimedKey = "lastStakingRewardsWavesClaimed"
+let lastStakingRewardsXtnClaimedKey = "lastStakingRewardsXtnClaimed"
+let lastStakingRewardsViresClaimedKey = "lastStakingRewardsViresClaimed"
+let lastStakingRewardsWXClaimedKey = "lastStakingRewardsWXClaimed"
+
+
+# Tracking devs amounts
+let devsWavesAmountKey = "devsWavesAmount"
+let devsSurfAmountKey = "devsSurfAmount"
+let devsWxAmountKey = "devsWxAmount"
+let devsXtnAmountKey = "devsXtnAmountKey"
+
+# Main Xtn Swap Data
+let xtnSwapBlockIdKey = "xtnSwapBlockId"
+let xtnSwapTransactionIdKey = "xtnSwapTransactionId"
+let xtnSwapPriceIndexKey = "xtnSwapPriceIndex"
+let xtnSwapXtnSwappedAmountKey = "xtnSwapXtnSwappedAmount"
+let xtnSwapWavesBalanceAtSwapKey = "xtnSwapWavesBalanceAtSwap"
+let xtnSwapWxBalanceAtSwapKey = "xtnSwapWxBalanceAtSwap"
+let xtnSwapViresBalanceAtSwapKey = "xtnSwapViresBalanceAtSwap"
+let xtnSwapXtnBalanceAtExchangeKey = "xtnSwapXtnBalanceAtExchange"
+let xtnSwapExchangeBlockIdKey = "xtnSwapExchangeBlockId"
+
+# Claiming periods tracking
+let lastSuccessSwapBlockHeight = "lastSuccessSwapBlockHeight"
+let currentWithdrawalPeriodIdKey = "currentWithdrawalPeriodId"
+let currentXTNSwapPeriodIdKey = "currentXTNSwapPeriodId"
+let currentSurfStakingRewardsPeriodIdKey = "currentSurfStakingRewardsPeriodIdKey"
+
+# Concrete XTN Swap Period Data 
+func keyCurrentXtnSwapPeriodXtnAmountForOneSurf(periodId: Int) = "currentXTNSwapPeriodXtnAmountForOneSurf" + SEP + periodId.toString()
+
+# Concrete Surf Staking Reward Period Data
+func keyCurrentSurfStakingRewardPeriodWavesAmountForOneSurf(periodId: Int) = "currentSurfStakingRewardPeriodWavesAmountForOneSurf" + SEP + periodId.toString()
+func keyCurrentSurfStakingRewardPeriodWxAmountForOneSurf(periodId: Int) = "currentSurfStakingRewardPeriodWwAmountForOneSurf" + SEP + periodId.toString()
+func keyCurrentSurfStakingRewardPeriodXtnAmountForOneSurf(periodId: Int) = "currentSurfStakingRewardPeriodXtnAmountForOneSurf" + SEP + periodId.toString()
+func keyCurrentSurfStakingRewardPeriodViresAmountForOneSurf(periodId: Int) = "currentSurfStakingRewardPeriodViresAmountForOneSurf" + SEP + periodId.toString()
+
+# Concrete User Data
+func keyCurrentUserTotalSurfStaked(address: String) = "currentUserTotalSurfStaked" + SEP + address
+func keyCurrentUserUnclaimedXtnSwapRewardPeriodId(address: String) = "currentUserUnclaimedXtnSwapRewardPeriodId" + SEP + address
+func keyCurrentUserUnclaimedSurfStakingRewardPeriodId(address: String) = "currentUserUnclaimedSurfStakingRewardPeriodId" + SEP + address
+func keyCurrentUserPendingWithdrawalPeriodId(address: String) = "currentUserPendingWithdrawalPeriodId" + SEP + address
+func keyCurrentUserTotalSurfPendingForWithdrawal(address: String) = "currentUserTotalSurfPendingForWithdrawal" + SEP + address
+func keyCurrentUserClaimedAssetsBasket(address: String) = "currentUserClaimedAssetsBasket" + SEP + address
+func keyCurrentUserClaimedAssetAmount(address: String, assetId: String) = "currentUserClaimedAssetAmount" + SEP + address + SEP + assetId
+
+# Util functions
+func asPayment(v: Any) = match v {
+    case p: AttachedPayment => p
+    case _ => throw("fail to cast into AttachedPayment")
+}
+
+func asInt(val: Any) = match val {
+    case valInt: Int => valInt
+    case _ => throw("fail to cast into Int")
+}
+
+func asIntOrThrow(val: Any, message: String) = match val {
+    case valInt: Int => valInt
+    case _ => throw(message)
+}
+
+func asIntOrDef(val: Any, default: Int) = match val {
+    case valInt: Int => valInt
+    case _ => default
+}
+
+func asString(val: Any) = match val {
+    case valString: String => valString
+    case _ => throw("fail to cast into String")
+}
+
+func asStringOrDef(val: Any, default: String) = match val {
+    case valString: String => valString
+    case _ => default
+}
+
+func asBoolean(val: Any) = match val {
+    case valBool: Boolean => valBool
+    case _ => throw("fail to cast into Boolean")
+}
+
+func asBooleanOrDef(val: Any, default: Boolean) = match val {
+    case valBool: Boolean => valBool
+    case _ => default
+}

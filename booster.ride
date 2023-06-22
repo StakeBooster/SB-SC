@@ -1,0 +1,620 @@
+{-# STDLIB_VERSION 6 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+{-# IMPORT lib.ride #-}
+
+# wavesSwapLimitInUsdnMax, swapLimitSpentInUsdn, blcks2LmtReset, gnsbtAmt, gnsbtAmtTotal, wavesSwapLimitMax, usdnSwapLimitMax
+func interactWithSwapParamsByUser() = {
+    strict result = invoke(Address(neutrinoStakingAddress), "swapParamsByUserSYSREADONLY", [this, 0], [])
+    match result {
+        case tuple: (Int, Int, Int, Int, Int, Int, Int) => 
+            [tuple._1, tuple._2, tuple._3, tuple._4, tuple._5, tuple._6, tuple._7]
+        case _ => throw("FATAL: Can't fetch data from neutrino contract")
+    }
+}
+
+# Internal function to check, if user has unclaimed rewards in previos periods
+func isUserHasUnclaimedRewardsInPreviousPeriods(address: String) = {
+    # Collect user data
+    let userUnclaimedXtnSwapRewardPeriodId = asIntOrDef(getInteger(keyCurrentUserUnclaimedXtnSwapRewardPeriodId(address)), -1)
+    let userUnclaimedSurfStakingRewardsPeriodId = asIntOrDef(getInteger(keyCurrentUserUnclaimedSurfStakingRewardPeriodId(address)), -1)
+
+    # Collect current periods data
+    let currentXTNSwapPeriod = asIntOrDef(getInteger(currentXTNSwapPeriodIdKey), 0)
+    let currentSurfStakingRewardsPeriod = asIntOrDef(getInteger(currentSurfStakingRewardsPeriodIdKey), 0)
+
+    # If user has unclaimed XTN or Surf staking rewards for previous periods, he must unclaim them first
+    if userUnclaimedXtnSwapRewardPeriodId > -1 && userUnclaimedXtnSwapRewardPeriodId < currentXTNSwapPeriod then true
+    else if userUnclaimedSurfStakingRewardsPeriodId > -1 && userUnclaimedSurfStakingRewardsPeriodId < currentSurfStakingRewardsPeriod then true
+    else false
+}
+
+func buildNewUserClaimedAssetBasketValue(address: String, assetId: String) = {
+    # Check if asset basket for current user is existed
+    let currentUserBasket = asStringOrDef(getString(keyCurrentUserClaimedAssetsBasket(address)), "")
+    if size(currentUserBasket) == 0 then assetId
+    else if contains(currentUserBasket, assetId) then currentUserBasket
+    else currentUserBasket + SEP + assetId
+}
+
+func buildNewUserClaimedAssetsBasketValue(address: String, assetIds: List[String]) = {
+    let currentUserBasket = asStringOrDef(getString(keyCurrentUserClaimedAssetsBasket(address)), "")
+    func accIfNotExists(accum: String, next: String) =
+        if contains(accum, next) then accum else accum + SEP + next
+    FOLD<15>(assetIds, currentUserBasket, accIfNotExists)
+}
+
+@Callable(i)
+func constructor(adminAddress: String, withdrawalFeeBasis: Int) = {
+    match getBoolean(constructedKey) {
+        case _: Boolean => throw("Constructor can be called just once")
+        case _ =>
+    [
+        BooleanEntry(constructedKey, true),
+        IntegerEntry(currentWithdrawalPeriodIdKey, 0),
+        IntegerEntry(currentXTNSwapPeriodIdKey, 0),
+        IntegerEntry(currentSurfStakingRewardsPeriodIdKey, 0),
+        IntegerEntry(pendingTotalSurfAmountToWithdrawalKey, 0),
+        IntegerEntry(lastSuccessSwapBlockHeight, 0),
+        IntegerEntry(xtnSwapStateEnumKey, caseXtnSwapStateIdle),
+        IntegerEntry(totalGNsbtKey, 0),
+        IntegerEntry(totalSurfWithdrawalRevenueKey, 0),
+        IntegerEntry(withdrawalFeeBasisKey, withdrawalFeeBasis),
+        IntegerEntry(totalXtnEarnedKey, 0),
+        IntegerEntry(totalStakingRewardsWavesClaimedKey, 0),
+        IntegerEntry(totalStakingRewardsXtnClaimedKey, 0),
+        IntegerEntry(totalStakingRewardsViresClaimedKey, 0),
+        IntegerEntry(totalStakingRewardsWXClaimedKey, 0),
+        StringEntry(adminAddressKey, adminAddress)
+    ]
+    }
+}
+
+@Callable(i)
+func changeAdminAddress(address: String) = {
+    if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then 
+        throw("Only admin can call this function")
+    else [StringEntry(adminAddressKey, address)]
+}
+
+@Callable(i)
+func extendPriceIndexByOneUp() = {
+    if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then 
+        throw("Only admin can call this function")
+    else
+        let swapPriceIndex = getIntegerValue(xtnSwapPriceIndexKey)
+        [IntegerEntry(xtnSwapPriceIndexKey, swapPriceIndex + 1)]
+}
+
+@Callable(i)
+func changeWithdrawalFeeBasis(newFeeBasis: Int) = {
+    if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then 
+        throw("Only admin can call this function")
+    else if newFeeBasis > 500 then 
+        throw("Max fee can't exceed 5%") 
+    else
+        [IntegerEntry(withdrawalFeeBasisKey, newFeeBasis)]
+}
+
+# Assets staking
+@Callable(i)
+func stake() = {
+    # Check payments
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("XTN swap in progress, wait approximatelly 3 minutes") 
+    else if size(i.payments) != 1 then 
+        throw("You must include exactly one payment in transaction")
+    else
+        let payment = asPayment(getElement(i.payments, 0))
+        if payment.assetId != surfAssetId || payment.amount < minAmount then throw("Wrong assetId or amount")
+        else
+            let callerAddressString = toBase58String(i.caller.bytes)
+      
+            if isUserHasUnclaimedRewardsInPreviousPeriods(callerAddressString) then
+                throw("You have unclaimed rewards, claim them first, then stake again")
+            else
+                strict result = invoke(Address(neutrinoStakingAddress), "stake", [], [payment]) # Stake to neutrino
+                # Data Updating
+                strict gNsbtUpdate = invoke(this, "updateGNsbt", [], []) # Update gNsbt
+                # 1. New total Surf staked
+                let newTotalSurfStaked = match(getInteger(totalSurfStakedKey)) {
+                    case v: Int => v + payment.amount
+                    case _ => payment.amount
+                }
+
+                # 2. New concrete user stake
+                let callerTotalSurfStakedKey = keyCurrentUserTotalSurfStaked(callerAddressString)
+
+                let newCallerTotalSurfStaked = match(getInteger(callerTotalSurfStakedKey)) {
+                    case v: Int => v + payment.amount
+                    case _ => payment.amount
+                }
+
+                let currentXTNSwapPeriod = asIntOrDef(getInteger(currentXTNSwapPeriodIdKey), 0)
+                let currentSurfStakingRewardsPeriod = asIntOrDef(getInteger(currentSurfStakingRewardsPeriodIdKey), 0)
+                [
+                    IntegerEntry(totalSurfStakedKey, newTotalSurfStaked),
+                    IntegerEntry(callerTotalSurfStakedKey, newCallerTotalSurfStaked),
+                    IntegerEntry(keyCurrentUserUnclaimedXtnSwapRewardPeriodId(callerAddressString), currentXTNSwapPeriod),
+                    IntegerEntry(keyCurrentUserUnclaimedSurfStakingRewardPeriodId(callerAddressString), currentSurfStakingRewardsPeriod)
+                ]
+}
+
+@Callable(i) 
+func applyForPendingWithdraw(amount: Int) = {
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("XTN swap in progress, wait approximatelly 3 minutes")
+    else if size(i.payments) > 0 then 
+        throw("This function does not accept payments") 
+    else if amount <= 0 then 
+        throw("Amount must be positive") 
+    else
+        let callerAddressString = toBase58String(i.caller.bytes)
+        let callerTotalSurfStaked = getIntegerValue(keyCurrentUserTotalSurfStaked(callerAddressString))
+
+        # Check user balances for insufficient funds
+        if callerTotalSurfStaked < amount then 
+            throw("Insufficient balance to withdraw") 
+        else
+            # Because execution of this function affects total surf staked user balance, we need to claim rewards first
+            if isUserHasUnclaimedRewardsInPreviousPeriods(callerAddressString) then
+                throw("You have unclaimed rewards, claim them first, then try again")
+            else
+                # Main Data
+                let currentWithdrawalId = getIntegerValue(currentWithdrawalPeriodIdKey) # This key initializized in constructor
+                let pendingTotalSurfToUnstakeFromNeutrino = getIntegerValue(pendingTotalSurfAmountToWithdrawalKey) # This key initialized in constructor
+
+                let userPendingWithdrawalPeriodId = asIntOrDef(getInteger(keyCurrentUserPendingWithdrawalPeriodId(callerAddressString)), -1)
+                let userTotalSurfPendingForWithdrawal = asIntOrDef(getInteger(keyCurrentUserTotalSurfPendingForWithdrawal(callerAddressString)), 0)
+
+                if userPendingWithdrawalPeriodId > -1 && userPendingWithdrawalPeriodId < currentWithdrawalId then
+                    throw("You have unclaimed surf on contract, please perform claim first")
+                else
+                    let currentRevenue = fraction(amount, getIntegerValue(withdrawalFeeBasisKey), 10000, HALFUP)
+                    let userNewTotalSurfStakedAmount = callerTotalSurfStaked - amount
+                    let userNewTotalSurfPendingForWithdrawal = userTotalSurfPendingForWithdrawal + (amount - currentRevenue)
+                    let newPendingTotalSurfToUnstakeFromNeutrino = pendingTotalSurfToUnstakeFromNeutrino + (amount - currentRevenue)
+                    let newTotalSurfStakedAmount = getIntegerValue(totalSurfStakedKey) - (amount - currentRevenue)
+                    let newTotalSurfRevenueAmount = getIntegerValue(totalSurfWithdrawalRevenueKey) + currentRevenue
+                    
+                    let result = [
+                        IntegerEntry(keyCurrentUserTotalSurfStaked(callerAddressString), userNewTotalSurfStakedAmount), # New user total surf staked amount
+                        IntegerEntry(keyCurrentUserPendingWithdrawalPeriodId(callerAddressString), currentWithdrawalId), # New user peding withdrawal period id
+                        IntegerEntry(keyCurrentUserTotalSurfPendingForWithdrawal(callerAddressString), userNewTotalSurfPendingForWithdrawal),
+                        IntegerEntry(pendingTotalSurfAmountToWithdrawalKey, newPendingTotalSurfToUnstakeFromNeutrino),
+                        IntegerEntry(totalSurfStakedKey, newTotalSurfStakedAmount),
+                        IntegerEntry(totalSurfWithdrawalRevenueKey, newTotalSurfRevenueAmount)
+                    ]
+
+                    # If user withdraw all of the funds, we need to delete tracking periods for him
+                    if userNewTotalSurfStakedAmount == 0 then
+                        result ++ [
+                            DeleteEntry(keyCurrentUserUnclaimedXtnSwapRewardPeriodId(callerAddressString)),
+                            DeleteEntry(keyCurrentUserUnclaimedSurfStakingRewardPeriodId(callerAddressString))
+                        ]
+                    else 
+                        result
+}
+
+@Callable(i)
+func performDistributedWithdraw() = {
+    if this != i.caller then throw("Internal function") else
+    if size(i.payments) > 0 then 
+        throw("This function does not accept payments") 
+    else
+        let currentWithdrawalId = getIntegerValue(currentWithdrawalPeriodIdKey)
+        let pendingTotalSurfToUnstakeFromNeutrino = getIntegerValue(pendingTotalSurfAmountToWithdrawalKey)
+
+        if pendingTotalSurfToUnstakeFromNeutrino <= 0 then []
+        else
+            strict result = invoke(Address(neutrinoStakingAddress), "unstake", [pendingTotalSurfToUnstakeFromNeutrino], []) # Unstake from neutrino
+            strict gNsbtUpdate = invoke(this, "updateGNsbt", [], []) # Update gNsbt
+            [
+                IntegerEntry(currentWithdrawalPeriodIdKey, currentWithdrawalId + 1),
+                IntegerEntry(pendingTotalSurfAmountToWithdrawalKey, 0)
+            ]
+}
+
+@Callable(i)
+func updateGNsbt() = {
+    if this != i.caller then throw("Internal function") else
+    strict infoResult = invoke(Address(neutrinoContractAddress), "swapParamsByUserSYSREADONLY", [toString(this), 0], [])
+        match infoResult {
+            case tuple: (Int, Int, Int, Int, Int, Int, Int) => 
+                let newGNsbtAmount = tuple._4
+                [IntegerEntry(totalGNsbtKey, newGNsbtAmount)]
+            case _ => throw("FATAL: Can't fetch data from neutrino contract")
+        }
+}
+
+@Callable(i)
+func claimSurf() = {
+    if size(i.payments) > 0 then 
+        throw("This function does not accept payments") 
+    else
+        let callerAddressString = toBase58String(i.caller.bytes)
+        let currentWithdrawalPeriodId = getIntegerValue(currentWithdrawalPeriodIdKey)
+        let userWithdrawalPeriodId = asIntOrDef(getInteger(keyCurrentUserPendingWithdrawalPeriodId(callerAddressString)), -1)
+        let userTotalSurfPendingForWithdrawal = asIntOrDef(getInteger(keyCurrentUserTotalSurfPendingForWithdrawal(callerAddressString)), 0)
+
+        if userWithdrawalPeriodId == -1 || userTotalSurfPendingForWithdrawal == 0 then 
+            throw("Nothing to withdraw") 
+        else if userWithdrawalPeriodId == currentWithdrawalPeriodId then 
+            throw("You must wait for period to complete")
+        else
+            [
+                ScriptTransfer(i.caller, userTotalSurfPendingForWithdrawal, surfAssetId),
+                DeleteEntry(keyCurrentUserPendingWithdrawalPeriodId(callerAddressString)),
+                DeleteEntry(keyCurrentUserTotalSurfPendingForWithdrawal(callerAddressString))
+            ]
+}
+
+@Callable(i) 
+func xtnSwapPart1swapXTNFromNeutrino() = {
+   if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("Wrong state, must be Idle") 
+    else if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then 
+        throw("Only admin can call this function")
+    else
+        strict withdrawResult = invoke(this, "performDistributedWithdraw", [], []) # First we must made the pending distributed withdrawal
+        strict surfStakingRewards = invoke(this, "internalSurfStakingRewardsClaimFromNeutrino", [], []) # Next we must claim surf staking rewards
+        strict result = invoke(Address(neutrinoContractAddress), "swapParamsByUserSYSREADONLY", [toString(this), 0], [])
+         match result {
+            case tuple: (Int, Int, Int, Int, Int, Int, Int) => 
+                if tuple._3 > 0 then 
+                    throw("Time is not come yet, you need to wait " + toString(tuple._3) + " blocks")
+                else
+                    let maxSwapAmount = tuple._7
+                    if maxSwapAmount < 1000000 then 
+                        throw("Min XTN amount to swap is 1, stake more SURF")
+                    else if assetBalance(this, xtnAssetId) < maxSwapAmount then 
+                        throw("XTN Balance on contract is smaller than max swap amount, increase XTN contract balance")
+                    else
+                        let currentWavesBalance = wavesBalance(this)
+                        let currentWXBalance = assetBalance(this, wxAssetId)
+                        let currentViresBalance = assetBalance(this, viresAssetId)
+
+                        strict swapNeutrinoToAssets = invoke(Address(neutrinoContractAddress), 
+                                                            "swapNeutrinoToBasket", 
+                                                            nil, 
+                                                            [AttachedPayment(xtnAssetId, maxSwapAmount)])
+
+                        let priceIndex = getIntegerValue(Address(neutrinoPriceIndexAddress), "price_index") + 1
+                        [
+                            IntegerEntry(xtnSwapBlockIdKey, height),
+                            StringEntry(xtnSwapTransactionIdKey, toBase58String(i.transactionId)),
+                            IntegerEntry(xtnSwapPriceIndexKey, priceIndex),
+                            IntegerEntry(xtnSwapXtnSwappedAmountKey, maxSwapAmount),
+                            IntegerEntry(xtnSwapWavesBalanceAtSwapKey, currentWavesBalance.available ),
+                            IntegerEntry(xtnSwapWxBalanceAtSwapKey, currentWXBalance),
+                            IntegerEntry(xtnSwapViresBalanceAtSwapKey, currentViresBalance),
+                            IntegerEntry(xtnSwapStateEnumKey, caseXtnSwapStateXtnToRewards)
+                        ]
+            case _ => throw("Incorrect data from neutrino smart contract")
+        }
+}
+
+@Callable(i)
+func xtnSwapPart2exchangeXtnSwapRewardsOnDex() = {
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateXtnToRewards then 
+        throw("Wrong state, must be XtnToRewards")
+    else if getIntegerValue(xtnSwapBlockIdKey) >= height then 
+        throw("Must wait for 1 block")
+    else if toBase58String(i.caller.bytes) != getStringValue(adminAddressKey) then 
+        throw("Only admin can call this function")
+    else
+        let swapTransationId = getStringValue(xtnSwapTransactionIdKey)
+        let swapPriceIndex = getIntegerValue(xtnSwapPriceIndexKey)
+
+        strict withdraw_res = invoke(Address(neutrinoContractAddress), "withdraw", [toString(this), swapPriceIndex, swapTransationId], [])
+
+        # Determining rewards
+        let wavesBalanceAtSwap = getIntegerValue(xtnSwapWavesBalanceAtSwapKey)
+        let wxBalanceAtSwap = getIntegerValue(xtnSwapWxBalanceAtSwapKey)
+        let viresBalanceAtSwap = getIntegerValue(xtnSwapViresBalanceAtSwapKey)
+
+        let currentWavesBalance = wavesBalance(this)
+        let currentWXBalance = assetBalance(this, wxAssetId)
+        let currentViresBalance = assetBalance(this, viresAssetId)
+
+        strict wavesRewards = currentWavesBalance.available - wavesBalanceAtSwap
+        strict wxRewards = currentWXBalance - wxBalanceAtSwap
+        strict viresRewards = currentViresBalance - viresBalanceAtSwap
+
+        strict xtnAmountBeforeExchange = assetBalance(this, xtnAssetId)
+        let xtnSwapped = getIntegerValue(xtnSwapXtnSwappedAmountKey)
+        
+        # Perform three dex exchanges
+        strict exchangeWaves = {
+            if wavesRewards <= 0 then []
+            else
+                strict wavesSwap = invoke(Address(wavesExchangeDexContract), 
+                                    "swap", 
+                                    [0, toString(Address(xtnAssetId)), toString(this)], 
+                                    [AttachedPayment(unit, wavesRewards)])
+                []
+        }
+        strict exchangeVires = {
+            if viresRewards <= 0 then []
+            else
+                strict viresSwap = invoke(Address(wavesExchangeDexContract), 
+                                    "swap", 
+                                    [0, toString(Address(xtnAssetId)), toString(this)], 
+                                    [AttachedPayment(viresAssetId, viresRewards)])
+                []
+        }
+        strict exchangeWX = {
+            if wxRewards <= 0 then []
+            else
+                strict wxSwap = invoke(Address(wavesExchangeDexContract), 
+                                    "swap", 
+                                    [0, toString(Address(xtnAssetId)), toString(this)], 
+                                    [AttachedPayment(wxAssetId, wxRewards)])
+                []
+        }
+        let currentXtnAmount = assetBalance(this, xtnAssetId)
+        let currentXtnSwapPeriodId = getIntegerValue(currentXTNSwapPeriodIdKey)
+        let totalSurfStaked = getIntegerValue(totalSurfStakedKey)
+        let xtnRewardAmountForPeriod = currentXtnAmount - (xtnAmountBeforeExchange + xtnSwapped)
+
+        let xtnRewardPerOneSurfForPeriod = { if xtnRewardAmountForPeriod <= 0 then 0
+               else fraction(xtnRewardAmountForPeriod, MULT10, totalSurfStaked, HALFUP) }
+        [
+            IntegerEntry(xtnSwapXtnBalanceAtExchangeKey, assetBalance(this, xtnAssetId)),
+            IntegerEntry(xtnSwapExchangeBlockIdKey, height),
+            IntegerEntry(keyCurrentXtnSwapPeriodXtnAmountForOneSurf(currentXtnSwapPeriodId), xtnRewardPerOneSurfForPeriod),
+            IntegerEntry(currentXTNSwapPeriodIdKey, currentXtnSwapPeriodId + 1),
+            IntegerEntry(xtnSwapStateEnumKey, caseXtnSwapStateIdle),
+            IntegerEntry(lastSuccessSwapBlockHeight, height),
+            IntegerEntry(lastSwapTotalSurfStakedKey, totalSurfStaked),
+            IntegerEntry(lastSwapTotalXtnEarnedKey, xtnRewardAmountForPeriod),
+            IntegerEntry(totalXtnEarnedKey, getIntegerValue(totalXtnEarnedKey) + xtnRewardAmountForPeriod)
+        ]
+}
+
+@Callable(i)
+func claim() = {
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("XTN swap in progress, wait approximatelly 3 minutes")
+    else
+        strict xtnResult = invoke(this, "claimXtnSwapRewards", [toBase58String(i.caller.bytes)], [])
+        strict surfResult = invoke(this, "claimSurfStakingRewards", [toBase58String(i.caller.bytes)], [])
+        []
+}
+
+@Callable(i)
+func claimXtnSwapRewards(address: String) = {
+    if this != i.caller then throw("Internal function") else
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("XTN swap in progress, wait approximatelly 3 minutes")
+    else
+    if size(i.payments) > 0 then throw("This function does not accept payments") 
+    else
+        let currentXtnSwapPeriodId = asIntOrDef(getInteger(currentXTNSwapPeriodIdKey), 0)
+        let currentUserUnclaimedXtnSwapRewardPeriodId = asIntOrDef(getInteger(keyCurrentUserUnclaimedXtnSwapRewardPeriodId(address)), -1)
+
+        if currentUserUnclaimedXtnSwapRewardPeriodId == -1 then ([], -1) # Nothing to claim
+        else
+            if currentUserUnclaimedXtnSwapRewardPeriodId == currentXtnSwapPeriodId then 
+                throw("You need to wait for current swap period to finish")
+            else
+                let unclaimedXtnSwapsCount = currentXtnSwapPeriodId - currentUserUnclaimedXtnSwapRewardPeriodId
+                let userTotalSurfStaked = getIntegerValue(keyCurrentUserTotalSurfStaked(address))
+
+                let newCurrentUserUnclaimedXtnSwapRewardPeriodId = if unclaimedXtnSwapsCount > 30 then 
+                            currentUserUnclaimedXtnSwapRewardPeriodId + 30 
+                        else currentXtnSwapPeriodId
+      
+                let iterations = if unclaimedXtnSwapsCount < 30 then unclaimedXtnSwapsCount else 30
+                strict result = invoke(this, 
+                                        "internalAccumulateXtnSwapRewards", 
+                                        [iterations, 0, currentUserUnclaimedXtnSwapRewardPeriodId, 0, userTotalSurfStaked, address], 
+                                        [])
+
+                [
+                    IntegerEntry(keyCurrentUserUnclaimedXtnSwapRewardPeriodId(address), newCurrentUserUnclaimedXtnSwapRewardPeriodId)
+                ]
+}
+
+@Callable(i)
+func internalAccumulateXtnSwapRewards(iterations: Int, 
+                                      current: Int, 
+                                      startXtnSwapPeriodId: Int, 
+                                      accumulatedRewardXtn: Int, 
+                                      userSurfAmount: Int, 
+                                      address: String) = {
+    if this != i.caller then throw("Internal function") 
+    else if current >= iterations then 
+        if accumulatedRewardXtn > 0 then
+            let currentAlreadyClaimedXtnByUser = asIntOrDef(getInteger(keyCurrentUserClaimedAssetAmount(address, toString(Address(xtnAssetId)))), 0)
+            let newAmount = currentAlreadyClaimedXtnByUser + accumulatedRewardXtn
+            let newAssetsBasket = buildNewUserClaimedAssetBasketValue(address, toString(Address(xtnAssetId)))
+            [ 
+                StringEntry(keyCurrentUserClaimedAssetsBasket(address), newAssetsBasket),
+                IntegerEntry(keyCurrentUserClaimedAssetAmount(address, toString(Address(xtnAssetId))), newAmount),
+                ScriptTransfer(addressFromStringValue(address), accumulatedRewardXtn, xtnAssetId)
+            ] 
+        else 
+            [] 
+    else
+        let xtnAmountPerSurf = asIntOrDef(getInteger(keyCurrentXtnSwapPeriodXtnAmountForOneSurf(startXtnSwapPeriodId + current)), 0)
+        let reward = if xtnAmountPerSurf == 0 then 0 else
+        fraction(xtnAmountPerSurf, userSurfAmount, MULT10, HALFUP)
+    
+        strict result = invoke(this, 
+                                "internalAccumulateXtnSwapRewards", 
+                                [iterations, current + 1, startXtnSwapPeriodId + current, accumulatedRewardXtn + reward, userSurfAmount, address], 
+                                [])
+        []
+}
+
+@Callable(i)
+func claimSurfStakingRewards(address: String) = {
+    if this != i.caller then throw("Internal function") else
+    if getIntegerValue(xtnSwapStateEnumKey) != caseXtnSwapStateIdle then 
+        throw("XTN swap in progress, wait approximatelly 3 minutes")
+    else
+    if size(i.payments) > 0 then 
+        throw("This function does not accept payments") 
+    else
+        let currentSurfStakingRewardsPeriodId = asIntOrDef(getInteger(currentSurfStakingRewardsPeriodIdKey), 0)
+        let currentUserUnclaimedSurfStakingRewardPeriodId = asIntOrDef(getInteger(keyCurrentUserUnclaimedSurfStakingRewardPeriodId(address)), -1)
+
+        if currentUserUnclaimedSurfStakingRewardPeriodId == -1 then 
+            ([], -1) 
+        else
+            if currentUserUnclaimedSurfStakingRewardPeriodId == currentSurfStakingRewardsPeriodId then 
+                throw("You need to wait for current swap period to finish")
+            else
+                let unclaimedSurfStakingsCount = currentSurfStakingRewardsPeriodId - currentUserUnclaimedSurfStakingRewardPeriodId
+                let userTotalSurfStaked = getIntegerValue(keyCurrentUserTotalSurfStaked(address))
+
+                let newCurrentUserUnclaimedSurfStakingRewardPeriodId = 
+                    if unclaimedSurfStakingsCount > 45 then currentUserUnclaimedSurfStakingRewardPeriodId + 45 else currentSurfStakingRewardsPeriodId
+      
+                let iterations = if unclaimedSurfStakingsCount < 45 then unclaimedSurfStakingsCount else 45
+                strict result = invoke(this, 
+                                        "internalAccumulateSurfStakingRewards", 
+                                         [
+                                            iterations, 
+                                            0, 
+                                            currentUserUnclaimedSurfStakingRewardPeriodId, 
+                                            0,
+                                            0,
+                                            0, 
+                                            0,
+                                            userTotalSurfStaked, 
+                                            address], 
+                                        [])
+
+                [
+                    IntegerEntry(keyCurrentUserUnclaimedSurfStakingRewardPeriodId(address), newCurrentUserUnclaimedSurfStakingRewardPeriodId)
+                ]
+}
+
+@Callable(i)
+func internalAccumulateSurfStakingRewards(iterations: Int, 
+                                          current: Int, 
+                                          startSurfSwapPeriodId: Int, 
+                                          accumulatedRewardWaves: Int, 
+                                          accumulatedRewardWx: Int, 
+                                          accumulatedRewardXtn: Int,
+                                          accumulatedRewardVires: Int, 
+                                          userSurfAmount: Int, 
+                                          address: String) = {
+    if this != i.caller then 
+        throw("Internal function") 
+    else if current >= iterations then 
+        if accumulatedRewardXtn > 0 || accumulatedRewardWaves > 0 || accumulatedRewardWx > 0 || accumulatedRewardVires > 0 then 
+
+            let newAssetsBasket = buildNewUserClaimedAssetsBasketValue(address, [ toString(Address(xtnAssetId)), toString(Address(wxAssetId)), toString(Address(viresAssetId)), "WAVES" ])
+            let newClaimedXtnValue = asIntOrDef(getInteger(keyCurrentUserClaimedAssetAmount(address, toString(Address(xtnAssetId)))), 0) + accumulatedRewardXtn
+            let newClaimedWxValue = asIntOrDef(getInteger(keyCurrentUserClaimedAssetAmount(address, toString(Address(wxAssetId)))), 0) + accumulatedRewardWx
+            let newClaimedViresValue = asIntOrDef(getInteger(keyCurrentUserClaimedAssetAmount(address, toString(Address(viresAssetId)))), 0) + accumulatedRewardVires
+            let newClaimedWavesValue = asIntOrDef(getInteger(keyCurrentUserClaimedAssetAmount(address, "WAVES")), 0) + accumulatedRewardWaves
+            [
+                IntegerEntry(keyCurrentUserClaimedAssetAmount(address, toString(Address(xtnAssetId))), newClaimedXtnValue),
+                IntegerEntry(keyCurrentUserClaimedAssetAmount(address, toString(Address(wxAssetId))), newClaimedWxValue),
+                IntegerEntry(keyCurrentUserClaimedAssetAmount(address, toString(Address(viresAssetId))), newClaimedViresValue),
+                IntegerEntry(keyCurrentUserClaimedAssetAmount(address, "WAVES"), newClaimedWavesValue),
+                StringEntry(keyCurrentUserClaimedAssetsBasket(address), newAssetsBasket),
+                ScriptTransfer(addressFromStringValue(address), accumulatedRewardXtn, xtnAssetId),
+                ScriptTransfer(addressFromStringValue(address), accumulatedRewardWaves, unit),
+                ScriptTransfer(addressFromStringValue(address), accumulatedRewardWx, wxAssetId),
+                ScriptTransfer(addressFromStringValue(address), accumulatedRewardVires, viresAssetId)
+            ] 
+        else 
+            [] 
+    else
+        let xtnAmountPerSurf = asIntOrDef(getInteger(keyCurrentSurfStakingRewardPeriodXtnAmountForOneSurf(startSurfSwapPeriodId + current)), 0)
+        let wavesAmountPerSurf = asIntOrDef(getInteger(keyCurrentSurfStakingRewardPeriodWavesAmountForOneSurf(startSurfSwapPeriodId + current)), 0)
+        let wxAmountPerSurf = asIntOrDef(getInteger(keyCurrentSurfStakingRewardPeriodWxAmountForOneSurf(startSurfSwapPeriodId + current)), 0)
+        let viresAmountPerSurf = asIntOrDef(getInteger(keyCurrentSurfStakingRewardPeriodViresAmountForOneSurf(startSurfSwapPeriodId + current)), 0)
+
+        let xtnReward = if xtnAmountPerSurf == 0 then 0 else
+            fraction(xtnAmountPerSurf, userSurfAmount, MULT10, HALFUP)
+        let wavesReward = if wavesAmountPerSurf == 0 then 0 else
+            fraction(wavesAmountPerSurf, userSurfAmount, MULT10, HALFUP)
+        let wxReward = if wxAmountPerSurf == 0 then 0 else
+            fraction(wxAmountPerSurf, userSurfAmount, MULT10, HALFUP)
+        let viresReward = if viresAmountPerSurf == 0 then 0 else
+            fraction(viresAmountPerSurf, userSurfAmount, MULT10, HALFUP)
+    
+        strict result = invoke(this, 
+                                "internalAccumulateSurfStakingRewards", 
+                                [
+                                    iterations, 
+                                    current + 1, 
+                                    startSurfSwapPeriodId + current, 
+                                    accumulatedRewardWaves + wavesReward, 
+                                    accumulatedRewardWx + wxReward, 
+                                    accumulatedRewardXtn + xtnReward, 
+                                    accumulatedRewardVires + viresReward,
+                                    userSurfAmount, 
+                                    address
+                                ], 
+                                [])
+        []
+}
+
+@Callable(i)
+func internalSurfStakingRewardsClaimFromNeutrino() = {
+    if this != i.caller then throw("Internal function") else
+    if size(i.payments) > 0 then throw("This function does not accept payments") else
+  
+    strict currentWavesOnContract = wavesBalance(this)
+    strict currentWxOnContract = assetBalance(this, wxAssetId)
+    strict currentXtnOnContract = assetBalance(this, xtnAssetId)
+    strict currentViresOnContract = assetBalance(this, viresAssetId)
+
+    # Claim rewards
+    strict result = invoke(Address(neutrinoStakingAddress), "claimRewards", [], [])
+
+    # New balances
+    let newWavesOnContract = wavesBalance(this)
+    let newWxOnContract = assetBalance(this, wxAssetId)
+    let newXtnOnContract = assetBalance(this, xtnAssetId)
+    let newViresOnContract = assetBalance(this, viresAssetId)
+
+    # Earned amounts
+    let wavesRewardAmountForPeriod = newWavesOnContract.available - currentWavesOnContract.available
+    let wxRewardAmountForPeriod = newWxOnContract - currentWxOnContract
+    let xtnRewardAmountForPeriod = newXtnOnContract - currentXtnOnContract
+    let viresRewardAmountForPeriod = newViresOnContract - currentViresOnContract
+
+    let currentSurfStakingRewardsPeriodId = getIntegerValue(currentSurfStakingRewardsPeriodIdKey)
+    let totalSurfStaked = asIntOrDef(getInteger(totalSurfStakedKey), 0)
+
+    if totalSurfStaked == 0 then 
+        [] 
+    else
+        # Calculate rewards per one SURF for current period
+        let wavesRewardPerOneSurfForPeriod = if wavesRewardAmountForPeriod == 0 then 0 
+            else fraction(wavesRewardAmountForPeriod, MULT10, totalSurfStaked, HALFUP)
+        let wxRewardPerOneSurfForPeriod = if wxRewardAmountForPeriod == 0 then 0 
+            else fraction(wxRewardAmountForPeriod, MULT10, totalSurfStaked, HALFUP)
+        let xtnRewardPerOneSurfForPeriod = if xtnRewardAmountForPeriod == 0 then 0 
+            else fraction(xtnRewardAmountForPeriod, MULT10, totalSurfStaked, HALFUP)
+        let viresRewardPerOneSurfForPeriod = if viresRewardAmountForPeriod == 0 then 0 
+            else fraction(viresRewardAmountForPeriod, MULT10, totalSurfStaked, HALFUP)
+
+        [
+            IntegerEntry(keyCurrentSurfStakingRewardPeriodWavesAmountForOneSurf(currentSurfStakingRewardsPeriodId), wavesRewardPerOneSurfForPeriod),
+            IntegerEntry(keyCurrentSurfStakingRewardPeriodWxAmountForOneSurf(currentSurfStakingRewardsPeriodId), wxRewardPerOneSurfForPeriod),
+            IntegerEntry(keyCurrentSurfStakingRewardPeriodXtnAmountForOneSurf(currentSurfStakingRewardsPeriodId), xtnRewardPerOneSurfForPeriod),
+            IntegerEntry(keyCurrentSurfStakingRewardPeriodViresAmountForOneSurf(currentSurfStakingRewardsPeriodId), viresRewardPerOneSurfForPeriod),
+            IntegerEntry(currentSurfStakingRewardsPeriodIdKey, currentSurfStakingRewardsPeriodId + 1),
+            IntegerEntry(lastStakingRewardsWavesClaimedKey, wavesRewardAmountForPeriod),
+            IntegerEntry(lastStakingRewardsXtnClaimedKey, xtnRewardAmountForPeriod),
+            IntegerEntry(lastStakingRewardsViresClaimedKey, viresRewardAmountForPeriod),
+            IntegerEntry(lastStakingRewardsWXClaimedKey, wxRewardAmountForPeriod),
+            IntegerEntry(totalStakingRewardsWavesClaimedKey, getIntegerValue(totalStakingRewardsWavesClaimedKey) + wavesRewardAmountForPeriod),
+            IntegerEntry(totalStakingRewardsXtnClaimedKey, getIntegerValue(totalStakingRewardsXtnClaimedKey) + xtnRewardAmountForPeriod),
+            IntegerEntry(totalStakingRewardsViresClaimedKey, getIntegerValue(totalStakingRewardsViresClaimedKey) + viresRewardAmountForPeriod),
+            IntegerEntry(totalStakingRewardsWXClaimedKey, getIntegerValue(totalStakingRewardsWXClaimedKey) + wxRewardAmountForPeriod)
+        ]
+}
+
+@Verifier(tx)
+func verify() = sigVerify(tx.bodyBytes, tx.proofs[0], tx.senderPublicKey)
+        
